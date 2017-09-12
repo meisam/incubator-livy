@@ -22,6 +22,7 @@ import javax.servlet.http.HttpServletRequest
 import org.scalatra._
 import scala.concurrent._
 import scala.concurrent.duration._
+import scala.util.{Failure, Success, Try}
 
 import org.apache.livy.{LivyConf, Logging}
 import org.apache.livy.sessions.{Session, SessionManager}
@@ -118,13 +119,19 @@ abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
   }
 
   post("/") {
-    val session = sessionManager.register(createSession(request))
-    // Because it may take some time to establish the session, update the last activity
-    // time before returning the session info to the client.
-    session.recordActivity()
-    Created(clientSessionView(session, request),
-      headers = Map("Location" ->
-        (getRequestPathInfo(request) + url(getSession, "id" -> session.id.toString))))
+    Try {
+      sessionManager.register(createSession(request))
+    } match {
+      case Failure(ex: IllegalArgumentException) =>
+        Conflict(ex.getMessage)
+      case Success(session) =>
+        // Because it may take some time to establish the session, update the last activity
+        // time before returning the session info to the client.
+        session.recordActivity()
+        Created(clientSessionView(session, request),
+          headers = Map("Location" ->
+            (getRequestPathInfo(request) + url(getSession, "id" -> session.id.toString))))
+    }
   }
 
   private def getRequestPathInfo(request: HttpServletRequest): String = {
@@ -214,8 +221,15 @@ abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
   private def doWithSession(fn: (S => Any),
       allowAll: Boolean,
       checkFn: Option[(String, HttpServletRequest) => Boolean]): Any = {
-    val sessionId = params("id").toInt
-    sessionManager.get(sessionId) match {
+    val idParam: String = params("id")
+    val session = if (idParam.forall(_.isDigit)) {
+      val sessionId = idParam.toInt
+      sessionManager.get(sessionId)
+    } else {
+      val sessionName = idParam
+      sessionManager.get(sessionName)
+    }
+    session match {
       case Some(session) =>
         if (allowAll || checkFn.map(_(session.owner, request)).getOrElse(false)) {
           fn(session)
@@ -223,7 +237,7 @@ abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
           Forbidden()
         }
       case None =>
-        NotFound(s"Session '$sessionId' not found.")
+        NotFound(s"Session '$idParam' not found.")
     }
   }
 
