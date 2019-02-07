@@ -74,7 +74,8 @@ class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
   protected[this] final val idCounter = new AtomicInteger(0)
   protected[this] final val sessions = mutable.LinkedHashMap[Int, S]()
   private[this] final val sessionsByName = mutable.HashMap[String, S]()
-
+  @volatile
+  private[this] var isRunning = true
 
   private[this] final val sessionTimeoutCheck = livyConf.getBoolean(LivyConf.SESSION_TIMEOUT_CHECK)
   private[this] final val sessionTimeout =
@@ -94,17 +95,21 @@ class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
   def register(session: S): S = {
     info(s"Registering new session ${session.id}")
     synchronized {
-      session.name.foreach { sessionName =>
-        if (sessionsByName.contains(sessionName)) {
-          throw new IllegalArgumentException(s"Duplicate session name: ${session.name}")
-        } else {
-          sessionsByName.put(sessionName, session)
+      if (isRunning) {
+        session.name.foreach { sessionName =>
+          if (sessionsByName.contains(sessionName)) {
+            throw new IllegalArgumentException(s"Duplicate session name: ${session.name}")
+          } else {
+            sessionsByName.put(sessionName, session)
+          }
         }
+        sessions.put(session.id, session)
+        session.start()
+        session
+      } else {
+        throw new IllegalStateException("Cannot register session after shutdown.")
       }
-      sessions.put(session.id, session)
-      session.start()
     }
-    session
   }
 
   def get(id: Int): Option[S] = sessions.get(id)
@@ -119,7 +124,7 @@ class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
     get(id).map(delete)
   }
 
-  def delete(session: S): Future[Unit] = {
+  def del`      ete(session: S): Future[Unit] = {
     session.stop().map { case _ =>
       try {
         sessionStore.remove(sessionType, session.id)
@@ -138,8 +143,11 @@ class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
   def shutdown(): Unit = {
     val recoveryEnabled = livyConf.get(LivyConf.RECOVERY_MODE) != SESSION_RECOVERY_MODE_OFF
     if (!recoveryEnabled) {
-      sessions.values.map(_.stop).foreach { future =>
-        Await.ready(future, Duration.Inf)
+      synchronized {
+        isRunning = false
+        sessions.values.map(_.stop).foreach { future =>
+          Await.ready(future, Duration.Inf)
+        }
       }
     }
   }
