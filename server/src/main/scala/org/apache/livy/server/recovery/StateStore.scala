@@ -44,6 +44,9 @@ protected trait JsonMapper {
  * Hardcoded to use JSON serialization for now for easier ops. Will add better serialization later.
  */
 abstract class StateStore(livyConf: LivyConf) extends JsonMapper {
+
+  def upgrade(oldKeyName: String, newKeyName: String): Unit
+
   /**
    * Set a key-value pair to this state store. It overwrites existing value.
    * @throws Exception Throw when persisting the state store fails.

@@ -124,5 +124,67 @@ class ZooKeeperStateStore(
     }
   }
 
+  def upgrade(oldVersionPath: String, newVersionPath: String): Unit = {
+
+    @scala.annotation.tailrec
+    def copyChildrenData(pathsToVisit: List[String]): Unit = {
+      pathsToVisit match {
+        case Nil =>
+        // do nothing
+        case headPath :: remainingPaths =>
+          val headData = curatorClient.getData.forPath(headPath)
+          val headAcl = curatorClient.getACL.forPath(headPath)
+
+          val upgradedPath = newVersionPath + headPath.drop(oldVersionPath.length)
+          curatorClient.create().creatingParentsIfNeeded().forPath(upgradedPath)
+          curatorClient.setData().forPath(upgradedPath, headData)
+          curatorClient.setACL().withACL(headAcl).forPath(upgradedPath)
+
+          val children = curatorClient.getChildren().forPath(headPath).asScala.map {
+            case child if headPath == "/" => s"/$child"
+            case child => s"$headPath/$child"
+          }
+          copyChildrenData(remainingPaths ++ children)
+      }
+    }
+
+    def deleteOldVersion(pathsToVisit: List[String]): Unit = {
+      pathsToVisit match {
+        case Nil =>
+        // do nothing
+        case headPath :: remainingPaths =>
+
+          val children = curatorClient.getChildren().forPath(headPath).asScala.map {
+            case child if headPath == "/" => s"/$child"
+            case child => s"$headPath/$child"
+          }
+          deleteOldVersion(remainingPaths ++ children)
+          curatorClient.delete().forPath(headPath)
+      }
+    }
+
+    def checkUpgrade() : Unit = {
+      if (oldVersionPath == null ||
+        newVersionPath == null ||
+        oldVersionPath.length == 0 ||
+        newVersionPath.length == 0 ||
+        "/".equals(oldVersionPath) ||
+        "/".equals(newVersionPath) ||
+        oldVersionPath.startsWith(newVersionPath) ||
+        newVersionPath.startsWith(oldVersionPath) ||
+        !oldVersionPath.startsWith("/") ||
+        !newVersionPath.startsWith("/") ||
+        curatorClient.checkExists().forPath(oldVersionPath) == null ||
+        curatorClient.checkExists().forPath(newVersionPath) != null
+      ) {
+        throw new IllegalArgumentException(s"Cannot update from $oldVersionPath to $newVersionPath.")
+      }
+    }
+
+    checkUpgrade()
+    copyChildrenData(List(oldVersionPath))
+    deleteOldVersion(List(oldVersionPath))
+  }
+
   private def prefixKey(key: String) = s"/$zkKeyPrefix/$key"
 }

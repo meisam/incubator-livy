@@ -34,7 +34,8 @@ class SessionStore(
     store: => StateStore = StateStore.get) // For unit testing.
   extends Logging {
 
-  private val STORE_VERSION: String = "v1"
+  val STORE_PREVIOUS_VERSION: String = "v1"
+  val STORE_VERSION: String = "v2"
 
   /**
    * Persist a session to the session state store.
@@ -76,6 +77,10 @@ class SessionStore(
    */
   def remove(sessionType: String, id: Int): Unit = {
     store.remove(sessionPath(sessionType, id))
+  }
+
+  def upgradeLayout(): Unit = {
+    store.upgrade(STORE_PREVIOUS_VERSION, STORE_VERSION)
   }
 
   private def nextSessionIdPath(sessionType: String): String =

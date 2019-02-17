@@ -135,4 +135,8 @@ class FileSystemStateStore(
     set(key, incrementedValue.asInstanceOf[Object])
     incrementedValue
   }
+
+  override def upgrade(oldKeyName: String, newKeyName: String): Unit = {
+    fileContext.rename(absPath(oldKeyName), absPath(newKeyName), Rename.OVERWRITE)
+  }
 }
