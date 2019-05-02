@@ -45,7 +45,7 @@ protected trait JsonMapper {
  */
 abstract class StateStore(livyConf: LivyConf) extends JsonMapper {
 
-  def upgrade(oldKeyName: String, newKeyName: String): Unit
+  def upgrade(oldVersion: String, newVersion: String, keepOldVersion: Boolean = false): Unit
 
   /**
    * Set a key-value pair to this state store. It overwrites existing value.

@@ -34,8 +34,8 @@ class SessionStore(
     store: => StateStore = StateStore.get) // For unit testing.
   extends Logging {
 
-  val STORE_PREVIOUS_VERSION: String = "v1"
-  val STORE_VERSION: String = "v2"
+  private val STORE_PREVIOUS_VERSION: String = "v1"
+  private val STORE_VERSION: String = "v2"
 
   /**
    * Persist a session to the session state store.

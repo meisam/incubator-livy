@@ -16,11 +16,14 @@
  */
 package org.apache.livy.server.recovery
 
+import java.nio.ByteBuffer
+
 import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 
 import org.apache.curator.framework.{CuratorFramework, CuratorFrameworkFactory}
 import org.apache.curator.framework.api.UnhandledErrorListener
+import org.apache.curator.framework.api.transaction.{CuratorTransaction => Transaction, CuratorTransactionFinal}
 import org.apache.curator.framework.recipes.atomic.{DistributedAtomicLong => DistributedLong}
 import org.apache.curator.retry.RetryNTimes
 import org.apache.zookeeper.KeeperException.NoNodeException
@@ -38,7 +41,7 @@ class ZooKeeperStateStore(
     mockCuratorClient: Option[CuratorFramework] = None) // For testing
   extends StateStore(livyConf) with Logging {
 
-  import ZooKeeperStateStore._
+  import org.apache.livy.server.recovery.ZooKeeperStateStore._
 
   // Constructor defined for StateStore factory to new this class using reflection.
   def this(livyConf: LivyConf) {
@@ -120,70 +123,117 @@ class ZooKeeperStateStore(
       case atomicValue if atomicValue.succeeded() =>
         atomicValue.postValue()
       case _ =>
-        throw new java.io.IOException(s"Failed to atomically nextValueget the next value for $key.")
+        throw new java.io.IOException(s"Failed to atomically nextValue the next value for $key.")
     }
   }
 
-  def upgrade(oldVersionPath: String, newVersionPath: String): Unit = {
+  /**
+   * @note
+   *       To be used only once at startup and only when the layout of the recovery data changes.
+   * Upgrades the recovery data layout from v1 to v2 in one transaction.
+   * Either the operation succeeds or nothing happens.
+   *
+   * If the upgrade succeeds, the following is guaranteed:
+   * All v1 data is copied to v2 data.
+   * 1. The valued of `nextSessionId` is copied from
+   *   `/path/do/livy/nodes/v1/interactive/state` to
+   *   `/path/do/livy/nodes/v2/v9/interactive/nextSessionId` as a
+   *   [[org.apache.curator.framework.recipes.atomic.DistributedAtomicLong]].
+   * 1. The valued of `nextSessionId` is copied from
+   *   `/path/do/livy/nodes/v1/batch/state` to
+   *   `/path/do/livy/nodes/v2/v9/batch/nextSessionId` as a
+   * *   [[org.apache.curator.framework.recipes.atomic.DistributedAtomicLong]].
+   *
+   * Only upgrade from v1 to v2 is supported in this implementation.
+   * If keepOldVersion is set to false, the upgrade process deletes the old version data from ZK.
+   * @param oldVersion
+   * @param newVersion Must be set to v2 for this version of
+   * @param keepOldVersion
+   * @since 0.7
+   */
+  def upgrade(oldVersion: String, newVersion: String, keepOldVersion: Boolean = false): Unit = {
+    val nextSessionIdPattern = """\{"nextSessionId":([0-9]+)\}""".r
+    def isStateNode(zkNodePath: String) = {
+      zkNodePath.endsWith("interactive/state") || zkNodePath.endsWith("batch/state")
+    }
 
     @scala.annotation.tailrec
-    def copyChildrenData(pathsToVisit: List[String]): Unit = {
-      pathsToVisit match {
+    def copyChildrenData(zkNodesToCopy: List[String], transaction: Transaction): Transaction = {
+      zkNodesToCopy match {
         case Nil =>
-        // do nothing
-        case headPath :: remainingPaths =>
-          val headData = curatorClient.getData.forPath(headPath)
-          val headAcl = curatorClient.getACL.forPath(headPath)
-
-          val upgradedPath = newVersionPath + headPath.drop(oldVersionPath.length)
-          curatorClient.create().creatingParentsIfNeeded().forPath(upgradedPath)
-          curatorClient.setData().forPath(upgradedPath, headData)
-          curatorClient.setACL().withACL(headAcl).forPath(upgradedPath)
-
-          val children = curatorClient.getChildren().forPath(headPath).asScala.map {
-            case child if headPath == "/" => s"/$child"
-            case child => s"$headPath/$child"
+          transaction
+        case zkNode :: remainingZkNodeNodes =>
+          val zkNodeData = if (isStateNode(zkNode)) {
+            val jsonStateData = new String(curatorClient.getData.forPath(zkNode))
+            val nextSessionIdPattern(lastUsedId) = jsonStateData
+            val byteBuffer = ByteBuffer.allocate(java.lang.Long.BYTES)
+            byteBuffer.putLong(lastUsedId.toLong).array()
+          } else {
+            curatorClient.getData.forPath(zkNode)
           }
-          copyChildrenData(remainingPaths ++ children)
+          val zkNodeAcl = curatorClient.getACL.forPath(zkNode)
+
+          val upgradedNodePath = if (isStateNode(zkNode)) {
+            newVersion + zkNode.drop(oldVersion.length).dropRight("state".length) + "nextSessionId"
+          } else {
+            newVersion + zkNode.drop(oldVersion.length)
+          }
+          val nextTnx = transaction.create().withACL(zkNodeAcl)
+            .forPath(upgradedNodePath, zkNodeData).and()
+
+          val children = curatorClient.getChildren().forPath(zkNode).asScala.map {
+            case child if zkNode == "/" => s"/$child"
+            case child => s"$zkNode/$child"
+          }
+          copyChildrenData(remainingZkNodeNodes ++ children, nextTnx)
       }
     }
 
-    def deleteOldVersion(pathsToVisit: List[String]): Unit = {
-      pathsToVisit match {
+    def deleteOldVersion(zkNodesToDelete: List[String], transaction: Transaction): Transaction = {
+      zkNodesToDelete match {
         case Nil =>
-        // do nothing
-        case headPath :: remainingPaths =>
+          transaction
+        case zkNode :: remainingNodes =>
 
-          val children = curatorClient.getChildren().forPath(headPath).asScala.map {
-            case child if headPath == "/" => s"/$child"
-            case child => s"$headPath/$child"
+          val children = curatorClient.getChildren().forPath(zkNode).asScala.map {
+            case child if zkNode == "/" => s"/$child"
+            case child => s"$zkNode/$child"
           }
-          deleteOldVersion(remainingPaths ++ children)
-          curatorClient.delete().forPath(headPath)
+          val nextTransaction = deleteOldVersion(remainingNodes ++ children, transaction)
+          nextTransaction.delete().forPath(zkNode).and()
       }
     }
 
-    def checkUpgrade() : Unit = {
-      if (oldVersionPath == null ||
-        newVersionPath == null ||
-        oldVersionPath.length == 0 ||
-        newVersionPath.length == 0 ||
-        "/".equals(oldVersionPath) ||
-        "/".equals(newVersionPath) ||
-        oldVersionPath.startsWith(newVersionPath) ||
-        newVersionPath.startsWith(oldVersionPath) ||
-        !oldVersionPath.startsWith("/") ||
-        !newVersionPath.startsWith("/") ||
-        curatorClient.checkExists().forPath(oldVersionPath) == null ||
-        curatorClient.checkExists().forPath(newVersionPath) != null
-      ) {
-        throw new IllegalArgumentException(s"Cannot update from $oldVersionPath to $newVersionPath.")
+    def validUpgrade: Boolean = {
+      oldVersion != null &&
+        newVersion != null &&
+        newVersion.startsWith("/") &&
+        oldVersion.startsWith("/") &&
+        oldVersion.endsWith("/v1") &&
+        newVersion.endsWith("/v2") &&
+        !oldVersion.startsWith(newVersion ) &&
+        !newVersion.startsWith(oldVersion)
+    }
+
+    def commit(transaction: Transaction): Unit = {
+      transaction match {
+        case finalTransaction: CuratorTransactionFinal => finalTransaction.commit()
+        case _ => throw new RuntimeException(s"Failed to upgrade $oldVersion to $newVersion.")
       }
     }
 
-    checkUpgrade()
-    copyChildrenData(List(oldVersionPath))
-    deleteOldVersion(List(oldVersionPath))
+    if (validUpgrade) {
+      val runningTransaction = curatorClient.inTransaction().check().forPath(oldVersion).and()
+
+      val copyTransaction = copyChildrenData(List(oldVersion), runningTransaction)
+
+      val finalTransaction = if (keepOldVersion) {
+        copyTransaction
+      } else {
+        deleteOldVersion(List(oldVersion), copyTransaction)
+      }
+      commit(finalTransaction)
+    }
   }
 
   private def prefixKey(key: String) = s"/$zkKeyPrefix/$key"
